@@ -1,5 +1,4 @@
 import base64
-import hashlib
 import json
 import os
 import secrets
@@ -134,16 +133,6 @@ def find_mpv_path():
     return find_executable("mpv")
 
 
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-
-def pkce_pair():
-    verifier = b64url(secrets.token_bytes(32))
-    challenge = b64url(hashlib.sha256(verifier.encode("utf-8")).digest())
-    return verifier, challenge
-
-
 def read_http_error(e: urllib.error.HTTPError):
     try:
         raw = e.read()
@@ -223,10 +212,6 @@ def streamlink_stream_url(channel: str, quality: str):
     return url
 
 
-def ensure_cert_dir():
-    os.makedirs(CERT_DIR, exist_ok=True)
-
-
 def ensure_cryptography_installed():
     try:
         import cryptography  # noqa: F401
@@ -250,7 +235,7 @@ def create_https_certificate():
     import datetime
     import ipaddress
 
-    ensure_cert_dir()
+    os.makedirs(CERT_DIR, exist_ok=True)
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
@@ -309,7 +294,7 @@ def run_powershell_admin(command: str):
 
 
 def install_cert_admin():
-    ensure_cert_dir()
+    os.makedirs(CERT_DIR, exist_ok=True)
     if not os.path.exists(CERT_CER):
         raise RuntimeError("cert.cer not found")
     cmd = f'certutil -addstore -f Root "{CERT_CER}"'
@@ -401,6 +386,7 @@ class TwitchViewer(QWidget):
         self.token = load_json(TOKEN_FILE, None)
 
         self.client_id = (self.settings.get("client_id") or "").strip()
+        self.client_secret = (self.settings.get("client_secret") or "").strip()
         self.last_quality = (self.settings.get("quality") or "best").strip()
         self.only_live_default = bool(self.settings.get("only_live", True))
         self.embed_default = bool(self.settings.get("embed_mpv", True))
@@ -424,7 +410,6 @@ class TwitchViewer(QWidget):
 
         self.oauth_server = None
         self.oauth_thread = None
-        self.pkce_verifier = None
         self.oauth_state = None
 
         self.user_id = None
@@ -462,7 +447,7 @@ class TwitchViewer(QWidget):
 
     def bootstrap(self):
         self.render_recent()
-        if self.token_valid(self.token) and self.client_id:
+        if self.token_valid(self.token) and self.client_id and self.client_secret:
             try:
                 self.ensure_user_id()
                 self.refresh_follows(silent=True)
@@ -614,31 +599,35 @@ class TwitchViewer(QWidget):
         self.client_id_input.setText(self.client_id)
         api_form.addRow("Client ID", self.client_id_input)
 
+        self.client_secret_input = QLineEdit()
+        self.client_secret_input.setPlaceholderText("Enter your Twitch Client Secret")
+        self.client_secret_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.client_secret_input.setText(self.client_secret)
+        api_form.addRow("Client Secret", self.client_secret_input)
+
         self.save_settings_button = QPushButton("Save settings")
         self.save_settings_button.clicked.connect(self.save_settings_from_ui)
         api_form.addRow("", self.save_settings_button)
 
         layout.addWidget(api_box)
 
-        info_box = QGroupBox("How to get a Client ID")
+        info_box = QGroupBox("Confidential app setup")
         info_layout = QVBoxLayout(info_box)
 
         info_text = (
-            "This application is a desktop app and uses a Public Twitch application.\n\n"
-            "For Public applications Twitch does not provide a Client Secret.\n"
-            "This is normal and intended.\n\n"
+            "This program expects a Confidential Twitch application.\n\n"
             "Steps\n"
             "1 Open the Twitch Developer Console\n"
             "2 Create an application\n"
-            "3 Set Client Type to Public\n"
+            "3 Set Client Type to Confidential\n"
             "4 Add this Redirect URL exactly\n"
             f"{REDIRECT_URI}\n"
-            "5 Copy the Client ID into this program\n\n"
-            "If you see no Client Secret in the Twitch dashboard everything is correct."
+            "5 Copy Client ID and generate Client Secret\n"
+            "6 Paste both values here and save\n"
         )
-        self.public_info = QLabel(info_text)
-        self.public_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        info_layout.addWidget(self.public_info)
+        self.conf_info = QLabel(info_text)
+        self.conf_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        info_layout.addWidget(self.conf_info)
 
         layout.addWidget(info_box)
 
@@ -704,7 +693,9 @@ class TwitchViewer(QWidget):
 
     def save_settings_from_ui(self):
         self.client_id = (self.client_id_input.text() or "").strip()
+        self.client_secret = (self.client_secret_input.text() or "").strip()
         self.settings["client_id"] = self.client_id
+        self.settings["client_secret"] = self.client_secret
         self.settings["quality"] = (self.quality_box.currentText() or "best").strip()
         self.settings["only_live"] = bool(self.only_live_toggle.isChecked())
         self.settings["embed_mpv"] = bool(self.embed_toggle.isChecked())
@@ -730,10 +721,14 @@ class TwitchViewer(QWidget):
         if not refresh:
             raise RuntimeError("Missing refresh token")
 
+        if not self.client_id or not self.client_secret:
+            raise RuntimeError("Client ID and Client Secret are required")
+
         fields = {
             "grant_type": "refresh_token",
             "refresh_token": refresh,
             "client_id": self.client_id,
+            "client_secret": self.client_secret,
         }
 
         resp = form_post("https://id.twitch.tv/oauth2/token", fields)
@@ -774,8 +769,10 @@ class TwitchViewer(QWidget):
 
     def start_authorize(self):
         self.client_id = (self.client_id_input.text() or "").strip()
-        if not self.client_id:
-            QMessageBox.critical(self, "Error", "Set Client ID in Settings first")
+        self.client_secret = (self.client_secret_input.text() or "").strip()
+
+        if not self.client_id or not self.client_secret:
+            QMessageBox.critical(self, "Error", "Client ID and Client Secret are required in Settings")
             self.tabs.setCurrentIndex(self.settings_tab_index)
             return
 
@@ -785,13 +782,12 @@ class TwitchViewer(QWidget):
             return
 
         self.settings["client_id"] = self.client_id
+        self.settings["client_secret"] = self.client_secret
         save_json(SETTINGS_FILE, self.settings)
 
         self.stop_oauth_server()
 
-        self.pkce_verifier, challenge = pkce_pair()
         self.oauth_state = secrets.token_urlsafe(16)
-
         OAuthHandler.bus = self.oauth_bus
 
         try:
@@ -812,8 +808,6 @@ class TwitchViewer(QWidget):
             "redirect_uri": REDIRECT_URI,
             "scope": " ".join(SCOPES),
             "state": self.oauth_state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
         }
         url = "https://id.twitch.tv/oauth2/authorize?" + urllib.parse.urlencode(params)
         webbrowser.open(url)
@@ -842,10 +836,10 @@ class TwitchViewer(QWidget):
         try:
             fields = {
                 "client_id": self.client_id,
+                "client_secret": self.client_secret,
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
-                "code_verifier": self.pkce_verifier or "",
             }
 
             resp = form_post("https://id.twitch.tv/oauth2/token", fields)
@@ -885,9 +879,9 @@ class TwitchViewer(QWidget):
         self.status.setText("Not authorized")
 
     def refresh_follows(self, silent: bool):
-        if not self.client_id:
+        if not self.client_id or not self.client_secret:
             if not silent:
-                QMessageBox.critical(self, "Error", "Set Client ID in Settings first")
+                QMessageBox.critical(self, "Error", "Client ID and Client Secret are required in Settings")
             return
         if not self.token_valid(self.token):
             if not silent:
