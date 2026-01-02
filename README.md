@@ -32,10 +32,3 @@ The follow list shows only Twitch usernames.
 - mpv Windows build
 - streamlink installed in your venv or bundled in your build
 
-## Install
-
-### 1 Clone
-
-```bash
-git clone <your-repo-url>
-cd twitch_viewer
